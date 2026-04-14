@@ -7,9 +7,9 @@ from tqdm import tqdm
 print("============== 🚀 自动人脸流水线 Pro版 启动 ==============")
 
 # 1. 绑定你的 FF++ 根目录 (指向包含 original, Deepfakes 等文件夹的那个大目录)
-# ⚠️ 注意：请确保改成你电脑上的实际路径！
-RAW_DIR = r"D:\Graduation_Project_video\FF_c23_videos" 
-CROP_DIR = r"D:\Graduation_Project_video\cropped_faces"
+# ⚠️ 注意：请务必确保改成你电脑上的实际路径！根据你的截图，应该是下面的路径：
+RAW_DIR = r"E:\gravideo\ff-c23\FaceForensics++_C23" 
+CROP_DIR = r"E:\gravideo\cropped_faces"
 
 # 2. 唤醒显卡并装载 MTCNN
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
