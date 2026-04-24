@@ -12,7 +12,7 @@ try:
 except ImportError:
     print("⚠️ 请确保你的终端目前正处于 multiple-attention 文件夹下，且存在 models 文件夹！")
 
-# --- 1. 核心超参数配置 (全局变量可以放外面) ---
+# --- 1. 核心超参数配置 ---
 DATA_ROOT = r'E:\gravideo\final_dataset'
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 PHYSICAL_BATCH_SIZE = 4 
@@ -21,34 +21,59 @@ EPOCHS = 20
 LR = 0.0005
 
 # ==========================================
+# 🛠️ 核心 Bug 修复 1：定制人脸真伪专用的 ImageFolder
+# ==========================================
+class DeepfakeImageFolder(datasets.ImageFolder):
+    """
+    为了避免 PyTorch 默认的按字母排序分配 0 和 1 导致标签与原模型(Origin=0, Fake=1)相反，
+    这里重写 find_classes 方法，强制进行语义映射。
+    """
+    def find_classes(self, directory: str):
+        classes = sorted(entry.name for entry in os.scandir(directory) if entry.is_dir())
+        if not classes:
+            raise FileNotFoundError(f"找不到类别文件夹: {directory}")
+
+        class_to_idx = {}
+        for cls_name in classes:
+            # 只要文件夹名字包含 'origin' 或 'real' (不区分大小写)，就强制分配为 0 (真脸)
+            # 其他所有伪造算法文件夹统一分配为 1 (假脸)
+            if 'real' in cls_name.lower() or 'origin' in cls_name.lower():
+                class_to_idx[cls_name] = 0
+            else:
+                class_to_idx[cls_name] = 1
+                
+        print(f"📁 文件夹 [{os.path.basename(directory)}] 标签映射结果: {class_to_idx}")
+        return classes, class_to_idx
+
+
+# ==========================================
 # 🔴 Windows 保命锁：把核心流程关进 main 里
 # ==========================================
 if __name__ == '__main__':
-    print("🔥 RTX 3060 极限炼丹炉启动 (Windows 适配版)...")
+    print("🔥 RTX 3060 极限炼丹炉启动 (Bug 修复版)...")
 
     # --- 2. 数据加载与增强 ---
+    # 🛠️ 核心 Bug 修复 2：将归一化参数对齐原作者的 [0.5, 0.5, 0.5]
     train_transform = transforms.Compose([
-    transforms.Resize((380, 380)),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.ColorJitter(brightness=0.05, contrast=0.05),#从0.15降到0.05，使模型保留一定的抗干扰能力，但不至于让模型过度敏感
-    # 👇 新增：随机给 30% 的图片加上高斯模糊，模拟低端摄像头失焦
-    transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.3),
-    # 👇 新增：随机降低锐度，模拟视频高强度压缩带来的涂抹感
-    transforms.RandomAdjustSharpness(sharpness_factor=0.2, p=0.3),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
+        transforms.Resize((380, 380)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.05, contrast=0.05),
+        transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.3),
+        transforms.RandomAdjustSharpness(sharpness_factor=0.2, p=0.3),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) # 已修正为原模型标准
+    ])
 
     val_transform = transforms.Compose([
         transforms.Resize((380, 380)),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) # 已修正为原模型标准
     ])
 
-    train_set = datasets.ImageFolder(os.path.join(DATA_ROOT, 'train'), transform=train_transform)
-    val_set = datasets.ImageFolder(os.path.join(DATA_ROOT, 'val'), transform=val_transform)
+    # 使用我们刚写好的自定义加载器，它会自动把 real/origin 映射为 0
+    train_set = DeepfakeImageFolder(os.path.join(DATA_ROOT, 'train'), transform=train_transform)
+    val_set = DeepfakeImageFolder(os.path.join(DATA_ROOT, 'val'), transform=val_transform)
 
-    # 这里的 num_workers=2 在 Windows 下必须被 if __name__ == '__main__' 保护！
     train_loader = DataLoader(train_set, batch_size=PHYSICAL_BATCH_SIZE, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_set, batch_size=PHYSICAL_BATCH_SIZE, shuffle=False, num_workers=2)
 
@@ -66,9 +91,10 @@ if __name__ == '__main__':
 
     model = model.to(DEVICE)
 
-    # 显存保命策略：解冻高层和注意力机制
+    # 显存保命策略：冻结底层特征提取器，专注于多注意力机制的微调
     for name, param in model.named_parameters():
         param.requires_grad = False
+        # 放开注意力层、最后的分类器、以及主干网络最深处的一层
         if "attention_layer" in name or "_fc" in name or "blocks.6" in name:
             param.requires_grad = True
 
