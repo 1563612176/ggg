@@ -1,121 +1,82 @@
-import os
-import cv2
-import torch
 import numpy as np
-from tqdm import tqdm
 import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, auc, accuracy_score
-from facenet_pytorch import MTCNN
-from models.MAT import MAT
-import warnings
-warnings.filterwarnings("ignore") # 屏蔽烦人的红字警告
+from sklearn.metrics import roc_curve, auc
+import os
 
-print("============== 🎓 毕设终极图表生成系统启动 ==============")
+# ==========================================
+# 1. 环境配置：解决中文显示与绘图风格
+# ==========================================
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 使用黑体显示中文
+plt.rcParams['axes.unicode_minus'] = False    # 解决负号显示问题
+plt.style.use('seaborn-v0_8-paper')           # 使用学术论文风格
 
-# --- 1. 配置路径 ---
-REAL_DIR = r"D:\Graduation_Project_video\dataset_mini\real"
-FAKE_DIR = r"D:\Graduation_Project_video\dataset_mini\fake"
-MODEL_PATH = "pretrained/ff_c23.pth"
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+def plot_thesis_graphics(data_path='thesis_eval_results.npz'):
+    if not os.path.exists(data_path):
+        print(f"❌ 错误：找不到数据文件 {data_path}，请先运行数据采集脚本。")
+        return
 
-# --- 2. 唤醒模型 ---
-print(f"🚀 核心引擎自检: 正在使用 [{DEVICE}]")
-mtcnn = MTCNN(image_size=380, margin=40, keep_all=False, device=DEVICE)
-model = MAT(net='efficientnet-b4', feature_layer='b2', attention_layer='b5', M=4)
-model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE).get('state_dict', torch.load(MODEL_PATH, map_location=DEVICE)), strict=False)
-model.to(DEVICE)
-model.eval()
-
-# --- 3. 核心探测函数 ---
-def scan_dataset(video_dir, label_name):
-    videos = [v for v in os.listdir(video_dir) if v.endswith('.mp4')]
-    print(f"\n📂 开始扫描 [{label_name}] 阵地，共发现 {len(videos)} 个视频...")
+    # 加载数据
+    data = np.load(data_path)
+    y_true = data['y_true']
+    p_base = data['p_base']
+    p_local = data['p_local']
     
-    video_scores = []
-    for video_name in tqdm(videos, desc=f"化验 {label_name} 视频"):
-        video_path = os.path.join(video_dir, video_name)
-        cap = cv2.VideoCapture(video_path)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        sample_interval = max(1, frame_count // 10) # 提速：每个视频均匀抽 10 帧
-        
-        fake_probs = []
-        frame_idx = 0
-        with torch.no_grad():
-            while True:
-                ret, frame = cap.read()
-                if not ret: break
-                
-                if frame_idx % sample_interval == 0:
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    save_tmp = "tmp_face.jpg"
-                    face = mtcnn(frame_rgb, save_path=save_tmp)
-                    
-                    if face is not None:
-                        img = cv2.imread(save_tmp)
-                        img = cv2.resize(img, (380, 380))
-                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0
-                        img_tensor = torch.from_numpy(img).permute(2, 0, 1).float().unsqueeze(0).to(DEVICE)
-                        
-                        output = model(img_tensor)
-                        prob = torch.nn.functional.softmax(output, dim=1)[0, 1].item()
-                        fake_probs.append(prob)
-                frame_idx += 1
-        cap.release()
-        
-        if fake_probs:
-            video_scores.append(np.mean(fake_probs))
-            
-    return video_scores
+    # [核心逻辑] 根据论文公式 4-2 计算决策级集成概率
+    # Alpha=0.6 代表基准模型权重，0.4 代表本地高敏模型权重
+    p_ensemble = 0.6 * p_base + 0.4 * p_local
 
-# --- 4. 收集战报 ---
-real_scores = scan_dataset(REAL_DIR, "纯真视频 (Real)")
-fake_scores = scan_dataset(FAKE_DIR, "伪造视频 (Fake)")
+    # ==========================================
+    # 2. 绘制 ROC 曲线对比图 (跨域泛化能力证明)
+    # ==========================================
+    plt.figure(figsize=(8, 7), dpi=300)
+    
+    # 计算三组曲线
+    models = [
+        (y_true, p_base, '基准模型 (EfficientNet-B4)', '#1f77b4', '--'),
+        (y_true, p_local, '高敏模型 (MAT-L)', '#ff7f0e', '-.'),
+        (y_true, p_ensemble, '决策级异质集成模型 (本文方法)', '#d62728', '-')
+    ]
 
-if os.path.exists("tmp_face.jpg"): os.remove("tmp_face.jpg") # 清理临时文件
+    for y, p, label, color, style in models:
+        fpr, tpr, _ = roc_curve(y, p)
+        roc_auc = auc(fpr, tpr)
+        plt.plot(fpr, tpr, color=color, lw=2, linestyle=style, 
+                 label=f'{label} (AUC = {roc_auc:.4f})')
 
-# --- 5. 组装数据并计算高阶指标 ---
-y_true = [0] * len(real_scores) + [1] * len(fake_scores)
-y_scores = real_scores + fake_scores
-y_pred = [1 if score > 0.5 else 0 for score in y_scores]
+    plt.plot([0, 1], [0, 1], color='navy', lw=1, linestyle=':')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('假阳性率 (False Positive Rate)', fontsize=12)
+    plt.ylabel('真阳性率 (True Positive Rate)', fontsize=12)
+    plt.title('不同模型在真实野生数据集上的 ROC 曲线对比', fontsize=14, pad=15)
+    plt.legend(loc="lower right", fontsize=10)
+    plt.grid(alpha=0.3)
+    
+    plt.savefig('论文图表_ROC曲线.png', bbox_inches='tight')
+    print("✅ 已生成：论文图表_ROC曲线.png")
 
-acc = accuracy_score(y_true, y_pred)
-fpr, tpr, thresholds = roc_curve(y_true, y_scores)
-roc_auc = auc(fpr, tpr)
+    # ==========================================
+    # 3. 绘制概率分布直方图 (防御鲁棒性证明)
+    # ==========================================
+    plt.figure(figsize=(10, 6), dpi=300)
+    
+    # 筛选真实视频(label=0)下，两个模型的预测分布
+    # 证明：本地模型对真实视频（带噪）容易产生高分误报，而集成模型能将其修正
+    real_indices = np.where(y_true == 0)[0]
+    real_p_local = p_local[real_indices]
+    real_p_ensemble = p_ensemble[real_indices]
 
-print("\n" + "="*50)
-print(f"📈 【最终评估报告】")
-print(f"总计检验视频数: {len(y_true)} 个")
-print(f"模型综合准确率 (Accuracy): {acc*100:.2f}%")
-print(f"模型 AUC 面积值 (越接近1越牛): {roc_auc:.4f}")
-print("="*50)
+    plt.hist(real_p_local, bins=30, alpha=0.5, label='高敏模型 (存在底噪误报)', color='#ff7f0e', edgecolor='white')
+    plt.hist(real_p_ensemble, bins=30, alpha=0.7, label='集成模型 (决策平滑后)', color='#2ca02c', edgecolor='white')
 
-# --- 6. 自动绘制论文图表 ---
-print("\n🎨 正在为您绘制毕业论文图表，请稍候...")
-plt.style.use('seaborn-v0_8-darkgrid')
-plt.rcParams['font.sans-serif'] = ['SimHei'] # 解决图表中文显示问题
-plt.rcParams['axes.unicode_minus'] = False
+    plt.axvline(x=0.5, color='red', linestyle='--', label='分类阈值 (0.5)')
+    plt.xlabel('伪造概率预测值 (Score)', fontsize=12)
+    plt.ylabel('样本频数 (Frequency)', fontsize=12)
+    plt.title('真实场景视频下模型预测概率分布对比', fontsize=14, pad=15)
+    plt.legend(loc="upper right")
+    
+    plt.savefig('论文图表_概率分布直方图.png', bbox_inches='tight')
+    print("✅ 已生成：论文图表_概率分布直方图.png")
 
-# 图A：概率分布直方图
-plt.figure(figsize=(8, 6), dpi=300)
-plt.hist(real_scores, bins=10, alpha=0.7, color='green', label='真实视频 (Real)')
-plt.hist(fake_scores, bins=10, alpha=0.7, color='red', label='伪造视频 (Fake)')
-plt.axvline(x=0.5, color='black', linestyle='--', label='默认判别阈值 (0.5)')
-plt.title('模型对真假视频的判定概率分布 (Probability Distribution)', fontsize=14)
-plt.xlabel('判定为"假"的概率得分', fontsize=12)
-plt.ylabel('视频数量 (频数)', fontsize=12)
-plt.legend(fontsize=12)
-plt.savefig('论文图表_概率分布直方图.png', bbox_inches='tight')
-
-# 图B：ROC 曲线
-plt.figure(figsize=(8, 6), dpi=300)
-plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC 曲线 (AUC = {roc_auc:.4f})')
-plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-plt.xlim([-0.02, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('假阳性率 (False Positive Rate)', fontsize=12)
-plt.ylabel('真阳性率 (True Positive Rate)', fontsize=12)
-plt.title('接收者操作特征曲线 (ROC Curve)', fontsize=14)
-plt.legend(loc="lower right", fontsize=12)
-plt.savefig('论文图表_ROC曲线.png', bbox_inches='tight')
-
-print("✅ 图表绘制完毕！请在代码文件夹查看 [论文图表_概率分布直方图.png] 和 [论文图表_ROC曲线.png]！")
+if __name__ == "__main__":
+    plot_thesis_graphics()

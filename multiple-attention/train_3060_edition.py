@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
+import matplotlib.pyplot as plt  # [新增] 导入绘图库
 
 try:
     from models.MAT import MAT
@@ -24,10 +25,6 @@ LR = 0.0005
 # 🛠️ 核心 Bug 修复 1：定制人脸真伪专用的 ImageFolder
 # ==========================================
 class DeepfakeImageFolder(datasets.ImageFolder):
-    """
-    为了避免 PyTorch 默认的按字母排序分配 0 和 1 导致标签与原模型(Origin=0, Fake=1)相反，
-    这里重写 find_classes 方法，强制进行语义映射。
-    """
     def find_classes(self, directory: str):
         classes = sorted(entry.name for entry in os.scandir(directory) if entry.is_dir())
         if not classes:
@@ -35,8 +32,6 @@ class DeepfakeImageFolder(datasets.ImageFolder):
 
         class_to_idx = {}
         for cls_name in classes:
-            # 只要文件夹名字包含 'origin' 或 'real' (不区分大小写)，就强制分配为 0 (真脸)
-            # 其他所有伪造算法文件夹统一分配为 1 (假脸)
             if 'real' in cls_name.lower() or 'origin' in cls_name.lower():
                 class_to_idx[cls_name] = 0
             else:
@@ -50,10 +45,9 @@ class DeepfakeImageFolder(datasets.ImageFolder):
 # 🔴 Windows 保命锁：把核心流程关进 main 里
 # ==========================================
 if __name__ == '__main__':
-    print("🔥 RTX 3060 极限炼丹炉启动 (Bug 修复版)...")
+    print("🔥 RTX 3060 极限炼丹炉启动 (收敛图增强版)...")
 
     # --- 2. 数据加载与增强 ---
-    # 🛠️ 核心 Bug 修复 2：将归一化参数对齐原作者的 [0.5, 0.5, 0.5]
     train_transform = transforms.Compose([
         transforms.Resize((380, 380)),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -61,40 +55,32 @@ if __name__ == '__main__':
         transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.3),
         transforms.RandomAdjustSharpness(sharpness_factor=0.2, p=0.3),
         transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) # 已修正为原模型标准
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) 
     ])
 
     val_transform = transforms.Compose([
         transforms.Resize((380, 380)),
         transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) # 已修正为原模型标准
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) 
     ])
 
-    # 使用我们刚写好的自定义加载器，它会自动把 real/origin 映射为 0
     train_set = DeepfakeImageFolder(os.path.join(DATA_ROOT, 'train'), transform=train_transform)
     val_set = DeepfakeImageFolder(os.path.join(DATA_ROOT, 'val'), transform=val_transform)
 
     train_loader = DataLoader(train_set, batch_size=PHYSICAL_BATCH_SIZE, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_set, batch_size=PHYSICAL_BATCH_SIZE, shuffle=False, num_workers=2)
 
-    print(f"📦 数据加载完毕: 训练集 {len(train_set)} 张 | 验证集 {len(val_set)} 张")
-
     # --- 3. 初始化模型 ---
     model = MAT(net='efficientnet-b4', feature_layer='b2', attention_layer='b5', M=4)
 
     weight_path = "pretrained/ff_c23.pth"
     if os.path.exists(weight_path):
-        print(f"🔄 正在加载预训练权重: {weight_path}")
         model.load_state_dict(torch.load(weight_path, map_location=DEVICE), strict=False)
-    else:
-        print("⚠️ 未找到预训练权重，模型将从头开始随机初始化 (不推荐)！")
 
     model = model.to(DEVICE)
 
-    # 显存保命策略：冻结底层特征提取器，专注于多注意力机制的微调
     for name, param in model.named_parameters():
         param.requires_grad = False
-        # 放开注意力层、最后的分类器、以及主干网络最深处的一层
         if "attention_layer" in name or "_fc" in name or "blocks.6" in name:
             param.requires_grad = True
 
@@ -104,6 +90,7 @@ if __name__ == '__main__':
     scaler = GradScaler() 
 
     best_val_acc = 0.0
+    train_losses = []  # [新增] 用于存储每个 epoch 的平均损失
 
     # --- 5. 核心训练循环 ---
     for epoch in range(EPOCHS):
@@ -138,9 +125,12 @@ if __name__ == '__main__':
             
             train_bar.set_postfix({'Loss': f"{loss.item() * ACCUMULATION_STEPS:.4f}", 'Acc': f"{100.*correct/total:.2f}%"})
 
+        # [新增] 计算并记录当前 epoch 的平均训练损失
+        epoch_loss = running_loss / len(train_loader)
+        train_losses.append(epoch_loss)
+
         # --- 6. 验证循环 ---
         model.eval()
-        val_loss = 0.0
         val_correct = 0
         val_total = 0
         
@@ -149,19 +139,32 @@ if __name__ == '__main__':
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
                 with autocast():
                     outputs = model(images)
-                    loss = criterion(outputs, labels)
-                    
-                val_loss += loss.item()
                 _, predicted = outputs.max(1)
                 val_total += labels.size(0)
                 val_correct += predicted.eq(labels).sum().item()
                 
         val_acc = 100. * val_correct / val_total
-        print(f"📊 [Epoch {epoch+1} 总结] Train Loss: {running_loss/len(train_loader):.4f} | Val Acc: {val_acc:.2f}%")
+        print(f"📊 [Epoch {epoch+1} 总结] Train Loss: {epoch_loss:.4f} | Val Acc: {val_acc:.2f}%")
         
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), "best_3060_MAT_model.pth")
-            print(f"🏆 新纪录！已保存最佳模型权重 -> best_3060_MAT_model.pth")
+            print(f"🏆 保存最佳权重 -> best_3060_MAT_model.pth")
 
-    print("\n🎉 炼丹彻底结束！你的专属模型已出炉！")
+    print("\n🎉 训练结束！正在生成损失收敛曲线...")
+
+    # [新增] 绘制并保存损失收敛曲线图
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, EPOCHS + 1), train_losses, marker='o', linestyle='-', color='b', label='Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Average Loss')
+    plt.xticks(range(1, EPOCHS + 1))
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+    
+    # 保存图片，不设标题
+    plot_path = "fine_tuning_loss_curve.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"📈 损失收敛曲线图已保存至: {plot_path}")
+
+    print("\n🎉 全部工作已完成！")
